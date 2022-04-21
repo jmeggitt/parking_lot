@@ -8,8 +8,16 @@
 mod args;
 use crate::args::ArgRange;
 
+use criterion::{
+    black_box, criterion_group, criterion_main, AxisScale, BenchmarkId, Criterion,
+    PlotConfiguration, Throughput,
+};
+
+use std::arch::asm;
 #[cfg(any(windows, unix))]
 use std::cell::UnsafeCell;
+use std::thread::JoinHandle;
+use std::time::Instant;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,6 +26,10 @@ use std::{
     thread,
     time::Duration,
 };
+
+trait WorkLoad<T> {
+    fn work(x: &T) -> T;
+}
 
 trait Mutex<T> {
     fn new(v: T) -> Self;
@@ -57,6 +69,61 @@ impl<T> Mutex<T> for parking_lot::Mutex<T> {
     }
 }
 
+impl<T> Mutex<T> for parking_lot::FairMutex<T> {
+    fn new(v: T) -> Self {
+        Self::new(v)
+    }
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        f(&mut *self.lock())
+    }
+    fn name() -> &'static str {
+        "parking_lot::FairMutex"
+    }
+}
+
+/// As a comparison, also test a RwLock that gets used even though no reads occur.
+impl<T> Mutex<T> for parking_lot::RwLock<T> {
+    fn new(v: T) -> Self {
+        Self::new(v)
+    }
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        f(&mut *self.write())
+    }
+    fn name() -> &'static str {
+        "parking_lot::RwLock"
+    }
+}
+
+/// A regular value which pretends to be a mutex. Can be done with regular tests to measure
+/// benchmark overhead. Should only be used in single threaded use cases
+struct Theoretical<T>(UnsafeCell<T>);
+
+unsafe impl<T> Sync for Theoretical<T> {}
+unsafe impl<T> Send for Theoretical<T> {}
+
+impl<T> Mutex<T> for Theoretical<T> {
+    fn new(v: T) -> Self {
+        Theoretical(UnsafeCell::new(v))
+    }
+
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        unsafe { f(&mut *self.0.get()) }
+    }
+
+    fn name() -> &'static str {
+        "Overhead"
+    }
+}
+
 #[cfg(not(windows))]
 type SrwLock<T> = std::sync::Mutex<T>;
 
@@ -71,15 +138,14 @@ unsafe impl<T: Send> Send for SrwLock<T> {}
 #[cfg(windows)]
 impl<T> Mutex<T> for SrwLock<T> {
     fn new(v: T) -> Self {
-        let mut h: synchapi::SRWLOCK = synchapi::SRWLOCK { Ptr: std::ptr::null_mut() };
+        let mut h: synchapi::SRWLOCK = synchapi::SRWLOCK {
+            Ptr: std::ptr::null_mut(),
+        };
 
         unsafe {
             synchapi::InitializeSRWLock(&mut h);
         }
-        SrwLock(
-            UnsafeCell::new(v),
-            UnsafeCell::new(h),
-        )
+        SrwLock(UnsafeCell::new(v), UnsafeCell::new(h))
     }
     fn lock<F, R>(&self, f: F) -> R
     where
@@ -177,6 +243,49 @@ fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
     thread::sleep(Duration::from_secs(seconds_per_test as u64));
     keep_going.store(false, Ordering::Relaxed);
     threads.into_iter().map(|x| x.join().unwrap().0).collect()
+}
+
+fn run_no_load_iters<M: Mutex<usize> + Send + Sync + 'static>(
+    num_threads: usize,
+    iters_per_thread: usize,
+) -> Duration {
+    let lock = Arc::new(M::new(1usize));
+    let barrier = Arc::new(Barrier::new(num_threads));
+
+    let mut threads = vec![];
+    for i in 1..(num_threads + 1) {
+        let barrier = barrier.clone();
+        let lock = lock.clone();
+
+        threads.push(thread::spawn(move || {
+            barrier.wait();
+            let start_time = Instant::now();
+
+            for _ in 0..iters_per_thread {
+                lock.lock(|shared_value| {
+                    // Surround in black_box to prevent optimization of workload
+                    // Perform a single add which mutates the state to prevent shared_value from
+                    // being optimized away in the event of black_box failing on some targets
+                    *shared_value = black_box(shared_value.wrapping_add(i));
+                });
+            }
+
+            let ret = start_time.elapsed();
+            ret
+        }));
+    }
+
+    let lock_time = threads
+        .into_iter()
+        .map(JoinHandle::join)
+        .map(Result::unwrap)
+        .fold(Duration::from_secs(0), |a, b| a + b);
+
+
+    // Read the value in the mutex to further discourage optimization
+    assert_eq!(lock.lock(|x| *x), 1 + iters_per_thread * num_threads * (num_threads + 1) / 2);
+
+    lock_time
 }
 
 fn run_benchmark_iterations<M: Mutex<f64> + Send + Sync + 'static>(
@@ -280,32 +389,70 @@ fn run_all(
     }
 }
 
-fn main() {
-    let args = args::parse(&[
-        "numThreads",
-        "workPerCriticalSection",
-        "workBetweenCriticalSections",
-        "secondsPerTest",
-        "testIterations",
-    ]);
-    let mut first = true;
-    for num_threads in args[0] {
-        for work_per_critical_section in args[1] {
-            for work_between_critical_sections in args[2] {
-                for seconds_per_test in args[3] {
-                    for test_iterations in args[4] {
-                        run_all(
-                            &args,
-                            &mut first,
-                            num_threads,
-                            work_per_critical_section,
-                            work_between_critical_sections,
-                            seconds_per_test,
-                            test_iterations,
-                        );
-                    }
-                }
-            }
-        }
+/// A workload which has little to no effect. Potentially risky option since this relies on
+/// `criterion::black_box` working as intended to avoid the compiler optimizations ruining the
+/// benchmark. It should work as intended, but we are only given a full guarantee when running on
+/// nightly.
+struct NoLoad;
+
+impl<T: Copy> WorkLoad<T> for NoLoad {
+    fn work(x: &T) -> T {
+        *x
     }
 }
+
+/// A repeating bit sequence which should be difficult for the compiler to optimize.
+/// Tests on x86_64 with rustc 1.60 stable show the best compiler can do is unroll the for loop
+/// and get about 200 instructions.
+struct PRBS31;
+
+impl WorkLoad<u32> for PRBS31 {
+    #[inline(never)]
+    fn work(x: &u32) -> u32 {
+        let mut value = *x;
+        for _ in 0..32 {
+            let new_bit = ((value >> 30) ^ (value >> 27)) & 1;
+            value = ((value << 1) | new_bit) & ((1u32 << 31) - 1);
+        }
+        value
+    }
+}
+
+fn criterion_benchmark(c: &mut Criterion) {
+    let mut no_load = c.benchmark_group("no-load");
+
+    // We need to use logarithmic scaling otherwise it may be hard to see some cases
+    no_load.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
+
+    /// We need to run each action for extra iterations to ensure the mutex is actually has thechance to be contested.
+    const ACTIONS_PER_ITER: usize = 1000;
+
+    macro_rules! run_bench {
+        ($group:ident, $($mutex:ident)::+, $sub_id:ident, $threads:expr) => {{
+            let bench_id = BenchmarkId::new($($mutex)::+::<usize>::name(), $sub_id);
+
+            $group.bench_function(bench_id, |b| {
+                b.iter_custom(|i| run_no_load_iters::<$($mutex)::+::<usize>>($threads, i as usize * ACTIONS_PER_ITER) / ACTIONS_PER_ITER as u32)
+            });
+        }};
+    }
+
+    for threads in 1..=16 {
+        // Tell criterion we are bumping up the difficulty so it can account for it in the report
+        no_load.throughput(Throughput::Elements(threads as u64));
+
+        run_bench!(no_load, std::sync::Mutex, threads, threads);
+        run_bench!(no_load, parking_lot::RwLock, threads, threads);
+        run_bench!(no_load, parking_lot::FairMutex, threads, threads);
+        run_bench!(no_load, parking_lot::Mutex, threads, threads);
+
+        #[cfg(windows)]
+        run_bench!(no_load, SrwLock, threads, threads);
+
+        #[cfg(unix)]
+        run_bench!(no_load, PthreadMutex, threads, threads);
+    }
+}
+
+criterion_group!(benches, criterion_benchmark);
+criterion_main!(benches);
