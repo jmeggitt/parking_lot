@@ -27,51 +27,6 @@ mod mutex_types;
 
 use mutex_types::*;
 
-
-
-fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
-    num_threads: usize,
-    work_per_critical_section: usize,
-    work_between_critical_sections: usize,
-    seconds_per_test: usize,
-) -> Vec<usize> {
-    let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
-    let keep_going = Arc::new(AtomicBool::new(true));
-    let barrier = Arc::new(Barrier::new(num_threads));
-    let mut threads = vec![];
-    for _ in 0..num_threads {
-        let barrier = barrier.clone();
-        let lock = lock.clone();
-        let keep_going = keep_going.clone();
-        threads.push(thread::spawn(move || {
-            let mut local_value = 0.0;
-            let mut value = 0.0;
-            let mut iterations = 0usize;
-            barrier.wait();
-            while keep_going.load(Ordering::Relaxed) {
-                lock.1.lock(|shared_value| {
-                    for _ in 0..work_per_critical_section {
-                        *shared_value += value;
-                        *shared_value *= 1.01;
-                        value = *shared_value;
-                    }
-                });
-                for _ in 0..work_between_critical_sections {
-                    local_value += value;
-                    local_value *= 1.01;
-                    value = local_value;
-                }
-                iterations += 1;
-            }
-            (iterations, value)
-        }));
-    }
-
-    thread::sleep(Duration::from_secs(seconds_per_test as u64));
-    keep_going.store(false, Ordering::Relaxed);
-    threads.into_iter().map(|x| x.join().unwrap().0).collect()
-}
-
 fn bench_threads<P, F, A>(thread_count: usize, mut prepare: P, execute: F) -> Duration
 where
     P: FnMut() -> A,
@@ -151,7 +106,7 @@ where
 /// compiler is unable to optimize it away it still gives up a good base case comparison between the
 /// different mutexes.
 #[inline(never)]
-fn run_true_no_load_iters<M: Mutex<usize> + Send + Sync + 'static>(
+fn run_true_no_load_iters<M: Mutex<usize>>(
     num_threads: usize,
     iters_per_thread: usize,
 ) -> Duration {
@@ -178,10 +133,7 @@ fn run_true_no_load_iters<M: Mutex<usize> + Send + Sync + 'static>(
 /// These actions are included in the benchmark time but are not expected to exceed the time
 /// required to lock/unlock the mutex.
 #[inline(never)]
-fn run_no_load_iters<M: Mutex<usize> + Send + Sync + 'static>(
-    num_threads: usize,
-    iters_per_thread: usize,
-) -> Duration {
+fn run_no_load_iters<M: Mutex<usize>>(num_threads: usize, iters_per_thread: usize) -> Duration {
     let lock = Arc::new(M::new(1usize));
 
     let lock_time = bench_threads(
@@ -228,10 +180,7 @@ fn small_workload(x: u32, rounds: usize) -> u32 {
 /// A workload that is balanced so the ratio of work inside the exclusive region is
 /// `1 / num_threads`.
 #[inline(never)]
-fn run_balanced_iters<M: Mutex<u32> + Send + Sync + 'static>(
-    num_threads: usize,
-    iters_per_thread: usize,
-) -> Duration {
+fn run_balanced_iters<M: Mutex<u32>>(num_threads: usize, iters_per_thread: usize) -> Duration {
     let lock = Arc::new(M::new(1u32));
 
     bench_threads(
@@ -269,11 +218,11 @@ fn run_balanced_iters<M: Mutex<u32> + Send + Sync + 'static>(
 /// to be contested.
 const ACTIONS_PER_ITER: usize = 1000;
 
-fn run_no_load<M: Mutex<usize> + Send + Sync + 'static, T: Measurement<Value = Duration>>(
+fn run_no_load<M: Mutex<usize>, T: Measurement<Value = Duration>>(
     group: &mut BenchmarkGroup<T>,
     threads: usize,
 ) {
-    let bench_id = BenchmarkId::new(M::name(), threads);
+    let bench_id = BenchmarkId::new(M::NAME, threads);
 
     group.bench_function(bench_id, |b| {
         b.iter_custom(|i| {
@@ -288,11 +237,11 @@ fn run_no_load<M: Mutex<usize> + Send + Sync + 'static, T: Measurement<Value = D
     });
 }
 
-fn run_balanced<M: Mutex<u32> + Send + Sync + 'static, T: Measurement<Value = Duration>>(
+fn run_balanced<M: Mutex<u32>, T: Measurement<Value = Duration>>(
     group: &mut BenchmarkGroup<T>,
     threads: usize,
 ) {
-    let bench_id = BenchmarkId::new(M::name(), threads);
+    let bench_id = BenchmarkId::new(M::NAME, threads);
 
     group.bench_function(bench_id, |b| {
         b.iter_custom(|i| {
@@ -367,9 +316,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     run_no_load::<PthreadMutex<usize>, _>(&mut competing, 2);
     competing.finish();
 
-
-
-
     let mut no_load = c.benchmark_group("no-load");
 
     // We need to use logarithmic scaling otherwise it may be hard to see some cases
@@ -394,7 +340,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     }
 
     no_load.finish();
-
 
     let mut balanced = c.benchmark_group("balanced");
     balanced.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
