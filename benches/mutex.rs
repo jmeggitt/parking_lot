@@ -12,92 +12,14 @@ use criterion::{
 
 use criterion::measurement::Measurement;
 use std::cell::RefCell;
-use std::thread::JoinHandle;
 use std::time::Instant;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Barrier,
-    },
-    thread,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 mod mutex_types;
+mod util;
 
 use mutex_types::*;
-
-fn bench_threads<P, F, A>(thread_count: usize, mut prepare: P, execute: F) -> Duration
-where
-    P: FnMut() -> A,
-    F: Fn(usize, A) -> Duration + Copy + Send + 'static,
-    A: Send + 'static,
-{
-    let mut threads = vec![];
-    let start_barrier = Arc::new(Barrier::new(thread_count));
-    let config_barrier = Arc::new(Barrier::new(thread_count));
-
-    for thread_idx in 0..thread_count {
-        let start_barrier = start_barrier.clone();
-        let config_barrier = config_barrier.clone();
-        let args = prepare();
-        threads.push(thread::spawn(move || {
-            // Wait until all threads are started before attempting to set priority.
-            start_barrier.wait();
-
-            #[cfg(windows)]
-            unsafe {
-                use libc::c_int;
-                use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
-                use winapi::um::winbase::{THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL};
-
-                let native_thread = GetCurrentThread();
-                let priority;
-
-                // If the requested thread count is less than the available number of cores and the
-                // correct features are enabled, elevate to a critical priority level.
-                if thread_count <= num_cpus::get() && cfg!(features = "critical-bench") {
-                    priority = THREAD_PRIORITY_TIME_CRITICAL;
-                } else {
-                    priority = THREAD_PRIORITY_HIGHEST;
-                }
-
-                if SetThreadPriority(native_thread, priority as c_int) == 0 {
-                    panic!("Failed to set thread priority")
-                }
-            }
-
-            #[cfg(unix)]
-            unsafe {
-                use libc::{
-                    pthread_self, pthread_setschedparam, sched_get_priority_max, sched_param,
-                    SCHED_FIFO,
-                };
-
-                let params = sched_param {
-                    sched_priority: sched_get_priority_max(SCHED_FIFO),
-                };
-
-                if params.sched_priority == -1 {
-                    panic!("Unable to get max priority");
-                }
-
-                let native_thread = pthread_self();
-                pthread_setschedparam(native_thread, SCHED_FIFO, &params as *const sched_param);
-            }
-
-            // Wait for all threads to be configured then start the test
-            config_barrier.wait();
-            execute(thread_idx + 1, args)
-        }));
-    }
-
-    threads
-        .into_iter()
-        .map(JoinHandle::join)
-        .map(Result::unwrap)
-        .fold(Duration::from_secs(0), |a, b| a + b)
-}
+use util::*;
 
 /// Similar to `run_no_load_iters`, but with a completely empty workload. This run makes no
 /// attempt to trick the compiler into optimizing away the lock. If the compiler is able to
@@ -164,19 +86,6 @@ fn run_no_load_iters<M: Mutex<usize>>(num_threads: usize, iters_per_thread: usiz
     lock_time
 }
 
-/// A small workload which runs 320 rounds of PRBS31. This workload only requires a couple registers
-/// to run and is intended to be hard for the compiler to optimize. Inspecting assembly on x86_64
-/// shows the compiler just unrolls the loop if it is small enough and not much more.
-#[inline(never)]
-fn small_workload(x: u32, rounds: usize) -> u32 {
-    let mut value = x;
-    for _ in 0..rounds {
-        let new_bit = ((value >> 30) ^ (value >> 27)) & 1;
-        value = ((value << 1) | new_bit) & ((1u32 << 31) - 1);
-    }
-    value
-}
-
 /// A workload that is balanced so the ratio of work inside the exclusive region is
 /// `1 / num_threads`.
 #[inline(never)]
@@ -197,15 +106,13 @@ fn run_balanced_iters<M: Mutex<u32>>(num_threads: usize, iters_per_thread: usize
                     // Perform a single add which mutates the state to prevent shared_value from
                     // being optimized away in the event of black_box failing on some targets
                     // *shared_value = black_box(shared_value.wrapping_add(i));
-                    *shared_value = black_box(small_workload(black_box(*shared_value), 500));
+                    *shared_value = black_box(workload(black_box(*shared_value), 500));
                     local_value = local_value.wrapping_add(*shared_value);
                 });
                 total_time += start_time.elapsed();
 
                 // Perform proportional work outside of the critical region
-                for _ in 0..num_threads - 1 {
-                    local_value = black_box(small_workload(black_box(local_value), 500));
-                }
+                local_value = black_box(workload(local_value, 500 * (num_threads - 1)));
             }
 
             let _ = black_box(local_value);
