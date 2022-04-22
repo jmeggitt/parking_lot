@@ -5,21 +5,13 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-mod args;
-use crate::args::ArgRange;
-
 use criterion::{
     black_box, criterion_group, criterion_main, AxisScale, BenchmarkGroup, BenchmarkId, Criterion,
     PlotConfiguration, Throughput,
 };
 
 use criterion::measurement::Measurement;
-use std::arch::asm;
-use std::borrow::BorrowMut;
 use std::cell::RefCell;
-#[cfg(any(windows, unix))]
-use std::cell::UnsafeCell;
-use std::convert::TryFrom;
 use std::thread::JoinHandle;
 use std::time::Instant;
 use std::{
@@ -31,214 +23,11 @@ use std::{
     time::Duration,
 };
 
-trait WorkLoad<T> {
-    fn work(x: &T) -> T;
-}
+mod mutex_types;
 
-trait Mutex<T> {
-    fn new(v: T) -> Self;
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R;
-    fn name() -> &'static str;
-}
+use mutex_types::*;
 
-impl<T> Mutex<T> for std::sync::Mutex<T> {
-    fn new(v: T) -> Self {
-        Self::new(v)
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        f(&mut *self.lock().unwrap())
-    }
-    fn name() -> &'static str {
-        "std::sync::Mutex"
-    }
-}
-impl<T> Mutex<T> for std::sync::RwLock<T> {
-    fn new(v: T) -> Self {
-        Self::new(v)
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        f(&mut *self.write().unwrap())
-    }
-    fn name() -> &'static str {
-        "std::sync::RwLock"
-    }
-}
 
-impl<T> Mutex<T> for parking_lot::Mutex<T> {
-    fn new(v: T) -> Self {
-        Self::new(v)
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        f(&mut *self.lock())
-    }
-    fn name() -> &'static str {
-        "parking_lot::Mutex"
-    }
-}
-
-impl<T> Mutex<T> for parking_lot::FairMutex<T> {
-    fn new(v: T) -> Self {
-        Self::new(v)
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        f(&mut *self.lock())
-    }
-    fn name() -> &'static str {
-        "parking_lot::FairMutex"
-    }
-}
-
-/// As a comparison, also test a RwLock that gets used even though no reads occur.
-impl<T> Mutex<T> for parking_lot::ReentrantMutex<RefCell<T>> {
-    fn new(v: T) -> Self {
-        Self::new(RefCell::new(v))
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        let lock = self.lock();
-        let mut ref_mut = RefCell::borrow_mut(&*lock);
-        f(&mut *ref_mut)
-    }
-    fn name() -> &'static str {
-        "parking_lot::ReentrantMutex<RefCell>"
-    }
-}
-
-/// As a comparison, also test a RwLock that gets used even though no reads occur.
-impl<T> Mutex<T> for parking_lot::RwLock<T> {
-    fn new(v: T) -> Self {
-        Self::new(v)
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        f(&mut *self.write())
-    }
-    fn name() -> &'static str {
-        "parking_lot::RwLock"
-    }
-}
-
-/// A regular value which pretends to be a mutex. Can be done with regular tests to measure
-/// benchmark overhead. Should only be used in single threaded use cases
-#[repr(transparent)]
-struct FakeMutex<T>(UnsafeCell<T>);
-
-unsafe impl<T> Sync for FakeMutex<T> {}
-unsafe impl<T> Send for FakeMutex<T> {}
-
-impl<T> Mutex<T> for FakeMutex<T> {
-    fn new(v: T) -> Self {
-        FakeMutex(UnsafeCell::new(v))
-    }
-
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        unsafe { f(&mut *self.0.get()) }
-    }
-
-    fn name() -> &'static str {
-        "workload"
-    }
-}
-
-#[cfg(not(windows))]
-type SrwLock<T> = std::sync::Mutex<T>;
-
-#[cfg(windows)]
-use winapi::um::synchapi;
-
-#[cfg(windows)]
-struct SrwLock<T>(UnsafeCell<T>, UnsafeCell<synchapi::SRWLOCK>);
-#[cfg(windows)]
-unsafe impl<T> Sync for SrwLock<T> {}
-#[cfg(windows)]
-unsafe impl<T: Send> Send for SrwLock<T> {}
-#[cfg(windows)]
-impl<T> Mutex<T> for SrwLock<T> {
-    fn new(v: T) -> Self {
-        let mut h: synchapi::SRWLOCK = synchapi::SRWLOCK {
-            Ptr: std::ptr::null_mut(),
-        };
-
-        unsafe {
-            synchapi::InitializeSRWLock(&mut h);
-        }
-        SrwLock(UnsafeCell::new(v), UnsafeCell::new(h))
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        unsafe {
-            synchapi::AcquireSRWLockExclusive(self.1.get());
-            let res = f(&mut *self.0.get());
-            synchapi::ReleaseSRWLockExclusive(self.1.get());
-            res
-        }
-    }
-    fn name() -> &'static str {
-        "winapi_srwlock"
-    }
-}
-
-#[cfg(not(unix))]
-type PthreadMutex<T> = std::sync::Mutex<T>;
-
-#[cfg(unix)]
-struct PthreadMutex<T>(UnsafeCell<T>, UnsafeCell<libc::pthread_mutex_t>);
-#[cfg(unix)]
-unsafe impl<T> Sync for PthreadMutex<T> {}
-#[cfg(unix)]
-impl<T> Mutex<T> for PthreadMutex<T> {
-    fn new(v: T) -> Self {
-        PthreadMutex(
-            UnsafeCell::new(v),
-            UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
-        )
-    }
-    fn lock<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        unsafe {
-            libc::pthread_mutex_lock(self.1.get());
-            let res = f(&mut *self.0.get());
-            libc::pthread_mutex_unlock(self.1.get());
-            res
-        }
-    }
-    fn name() -> &'static str {
-        "pthread_mutex_t"
-    }
-}
-#[cfg(unix)]
-impl<T> Drop for PthreadMutex<T> {
-    fn drop(&mut self) {
-        unsafe {
-            libc::pthread_mutex_destroy(self.1.get());
-        }
-    }
-}
 
 fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
     num_threads: usize,
@@ -371,7 +160,7 @@ fn run_true_no_load_iters<M: Mutex<usize> + Send + Sync + 'static>(
     bench_threads(
         num_threads,
         || lock.clone(),
-        move |i, lock| {
+        move |_, lock| {
             let start_time = Instant::now();
 
             for _ in 0..iters_per_thread {
